@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -15,8 +16,18 @@ from rdflib import BNode, Graph, Literal as RdfLiteral, Namespace, URIRef
 
 BASE_PUBLIC = os.getenv("PUBLIC_BASE", "https://kvan-todb.hualab.nl").rstrip("/")
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+TEST_MODE_GET_WRITE = os.getenv("TEST_MODE_GET_WRITE", "false").strip().lower() in {"1", "true", "yes", "on"}
 _STORE_CACHE: dict[str, Store] = {}
 _STORE_CACHE_LOCK = Lock()
+COMMON_PREFIXES = {
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
+    "sdo": "https://schema.org/",
+}
+HAS_GRAPH_PREDICATE = f"{BASE_PUBLIC}/def/hasGraph"
 
 
 @dataclass
@@ -253,6 +264,75 @@ def _insert_triple(
     store.add(quad)
 
 
+def _link_db_graph(store: Store, db: str, graph: str) -> None:
+    _insert_triple(
+        store,
+        subject=_db_iri(db),
+        predicate=HAS_GRAPH_PREDICATE,
+        obj={"type": "iri", "value": _graph_iri(db, graph)},
+        graph_iri=None,
+    )
+
+
+def _predicate_from_query_key(key: str) -> str:
+    if not key:
+        raise APIError(400, "invalid_query_key", "Lege query key is niet toegestaan")
+    if ":" in key:
+        prefix, local = key.split(":", 1)
+        base = COMMON_PREFIXES.get(prefix)
+        if not base:
+            raise APIError(
+                400,
+                "unknown_prefix",
+                f"Onbekende prefix `{prefix}`",
+                {
+                    "key": key,
+                    "known_prefixes": COMMON_PREFIXES,
+                    "how_to_extend": (
+                        "Voeg een entry toe aan COMMON_PREFIXES in app/main.py, "
+                        "bijvoorbeeld: \"ex\": \"https://example.org/vocab/\""
+                    ),
+                },
+            )
+        if not local:
+            raise APIError(400, "invalid_query_key", f"Prefix key `{key}` mist local part")
+        return f"{base}{local}"
+    return f"{BASE_PUBLIC}/def/{quote(key, safe='')}"
+
+
+def _apply_get_test_writes(request: Request, *, db: str, graph: str | None = None, resource: str | None = None) -> None:
+    if not TEST_MODE_GET_WRITE:
+        return
+    params = list(request.query_params.multi_items())
+    if not params:
+        return
+
+    store = _ensure_store(db)
+    graph_created = False
+    if graph is not None:
+        graph_created = not _graph_exists(store, db, graph)
+    if graph is None:
+        subject = _db_iri(db)
+        graph_iri = None
+    elif resource is None:
+        subject = _graph_iri(db, graph)
+        graph_iri = _graph_iri(db, graph)
+    else:
+        subject = _resource_iri(db, graph, resource)
+        graph_iri = _graph_iri(db, graph)
+
+    for key, value in params:
+        _insert_triple(
+            store,
+            subject=subject,
+            predicate=_predicate_from_query_key(key),
+            obj=value,
+            graph_iri=graph_iri,
+        )
+    if graph_created:
+        _link_db_graph(store, db, graph)
+
+
 app = FastAPI(title="Resolvable URIs", version="0.1.0")
 
 
@@ -298,6 +378,7 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 @app.get("/id/{db}")
 def get_db(db: str, request: Request):
+    _apply_get_test_writes(request, db=db)
     if not _db_exists(db):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
 
@@ -331,6 +412,7 @@ async def post_db(db: str, request: Request):
 
 @app.get("/id/{db}/{graph}")
 def get_graph(db: str, graph: str, request: Request):
+    _apply_get_test_writes(request, db=db, graph=graph)
     if not _db_exists(db):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
 
@@ -359,6 +441,8 @@ async def post_graph(db: str, graph: str, request: Request):
         obj={"type": "literal", "value": label},
         graph_iri=_graph_iri(db, graph),
     )
+    if not existed:
+        _link_db_graph(store, db, graph)
 
     status = 200 if existed else 201
     return _pretty_json_response(
@@ -369,6 +453,7 @@ async def post_graph(db: str, graph: str, request: Request):
 
 @app.get("/id/{db}/{graph}/{resource:path}")
 def get_resource(db: str, graph: str, resource: str, request: Request):
+    _apply_get_test_writes(request, db=db, graph=graph, resource=resource)
     if not _db_exists(db):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
 
@@ -403,6 +488,8 @@ async def post_resource(db: str, graph: str, resource: str, request: Request):
         obj=o,
         graph_iri=_graph_iri(db, graph),
     )
+    if graph_created:
+        _link_db_graph(store, db, graph)
 
     return _pretty_json_response(
         {
