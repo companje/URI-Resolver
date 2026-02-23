@@ -1,5 +1,9 @@
 kvan-todb.hualab.nl {
-      tls internal
-      encode zstd gzip
-      reverse_proxy 127.0.0.1:8000
-  }
+    tls internal
+    encode zstd gzip
+
+    @rdf path /id* /def*
+    reverse_proxy @rdf 127.0.0.1:8000
+
+    reverse_proxy 127.0.0.1:8080
+}

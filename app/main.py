@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -9,7 +11,7 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 from pyoxigraph import DefaultGraph, Literal, NamedNode, Quad, Store
 from rdflib import BNode, Graph, Literal as RdfLiteral, Namespace, URIRef
 
@@ -17,6 +19,7 @@ from rdflib import BNode, Graph, Literal as RdfLiteral, Namespace, URIRef
 BASE_PUBLIC = os.getenv("PUBLIC_BASE", "https://kvan-todb.hualab.nl").rstrip("/")
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 TEST_MODE_GET_WRITE = os.getenv("TEST_MODE_GET_WRITE", "false").strip().lower() in {"1", "true", "yes", "on"}
+VIEWER_BASE = os.getenv("VIEWER_BASE", f"{BASE_PUBLIC}").rstrip("/")
 _STORE_CACHE: dict[str, Store] = {}
 _STORE_CACHE_LOCK = Lock()
 COMMON_PREFIXES = {
@@ -27,7 +30,25 @@ COMMON_PREFIXES = {
     "skos": "http://www.w3.org/2004/02/skos/core#",
     "sdo": "https://schema.org/",
 }
-HAS_GRAPH_PREDICATE = f"{BASE_PUBLIC}/def/hasGraph"
+HAS_PART_PREDICATE = "https://schema.org/hasPart"
+IS_PART_OF_PREDICATE = "https://schema.org/isPartOf"
+RDF_TYPE_PREDICATE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+DB_TYPE_IRI = f"{BASE_PUBLIC}/def/Database"
+GRAPH_TYPE_IRI = f"{BASE_PUBLIC}/def/Graph"
+SYSTEM_TYPE_IRI = f"{BASE_PUBLIC}/def/System"
+DEF_GRAPH_IRI = f"{BASE_PUBLIC}/def"
+SYSTEM_DB_NAME = "__system__"
+RDFS_LABEL_PREDICATE = "http://www.w3.org/2000/01/rdf-schema#label"
+RDFS_CLASS_IRI = "http://www.w3.org/2000/01/rdf-schema#Class"
+RDF_PROPERTY_IRI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
+_DEF_SEEDED = False
+_DEF_SEEDED_LOCK = Lock()
+_SYSTEM_METADATA_SEEDED = False
+_SYSTEM_METADATA_SEEDED_LOCK = Lock()
+
+
+def _system_iri() -> str:
+    return f"{BASE_PUBLIC}/id"
 
 
 @dataclass
@@ -44,6 +65,12 @@ def _db_path(db: str) -> Path:
 
 def _db_exists(db: str) -> bool:
     return _db_path(db).exists()
+
+
+def _evict_store(db: str) -> None:
+    with _STORE_CACHE_LOCK:
+        _STORE_CACHE.pop(db, None)
+    gc.collect()
 
 
 def _open_store(db: str) -> Store:
@@ -85,6 +112,24 @@ def _ensure_store(db: str) -> Store:
         ) from exc
 
 
+def _delete_db(db: str) -> None:
+    if db == SYSTEM_DB_NAME:
+        raise APIError(403, "forbidden", "Systeemdatabase kan niet verwijderd worden")
+    path = _db_path(db)
+    if not path.exists():
+        raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
+    _evict_store(db)
+    try:
+        shutil.rmtree(path)
+    except Exception as exc:
+        raise APIError(
+            500,
+            "db_delete_failed",
+            f"Database `{db}` kon niet worden verwijderd",
+            {"db": db, "cause": str(exc)},
+        ) from exc
+
+
 def _db_iri(db: str) -> str:
     return f"{BASE_PUBLIC}/id/{db}"
 
@@ -95,6 +140,10 @@ def _graph_iri(db: str, graph: str) -> str:
 
 def _resource_iri(db: str, graph: str, resource: str) -> str:
     return f"{BASE_PUBLIC}/id/{db}/{graph}/{resource}"
+
+
+def _def_iri(term: str) -> str:
+    return f"{BASE_PUBLIC}/def/{term}"
 
 
 def _term_to_rdflib(term: Any) -> Any:
@@ -154,6 +203,39 @@ def _determine_format(request: Request) -> str:
     return "json-ld"
 
 
+def _has_explicit_rdf_negotiation(request: Request) -> bool:
+    forced = getattr(request.state, "forced_format", None)
+    if forced in {"turtle", "json-ld"}:
+        return True
+    accept = (request.headers.get("accept") or "").lower()
+    if not accept:
+        return False
+    rdf_media_types = (
+        "application/ld+json",
+        "text/turtle",
+        "application/x-turtle",
+        "application/json",
+        "application/rdf+xml",
+        "application/n-triples",
+        "application/n-quads",
+        "application/trig",
+    )
+    return any(mt in accept for mt in rdf_media_types)
+
+
+def _viewer_redirect_if_needed(request: Request) -> Response | None:
+    if TEST_MODE_GET_WRITE and request.query_params:
+        return None
+    if _has_explicit_rdf_negotiation(request):
+        return None
+    path = request.scope.get("path", "")
+    if not (path.startswith("/id") or path.startswith("/def")):
+        return None
+    target_uri = f"{BASE_PUBLIC}{path}"
+    location = f"{VIEWER_BASE}?uri={quote(target_uri, safe='')}"
+    return RedirectResponse(url=location, status_code=303)
+
+
 async def _json_or_empty(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
@@ -163,6 +245,7 @@ async def _json_or_empty(request: Request) -> dict[str, Any]:
 
 
 def _serialize_graph(graph: Graph, output_format: str) -> tuple[str, str]:
+    graph.bind("def", URIRef(f"{BASE_PUBLIC}/def/"), override=True)
     if output_format == "turtle":
         ttl = graph.serialize(format="turtle")
         return ttl, "text/turtle; charset=utf-8"
@@ -227,6 +310,15 @@ def _resource_graph(store: Store, db: str, graph: str, resource: str) -> Graph:
     return g
 
 
+def _subject_graph(store: Store, subject_iri: str, graph_iri: str | None) -> Graph:
+    g = Graph()
+    graph_name = NamedNode(graph_iri) if graph_iri else DefaultGraph()
+    subject = NamedNode(subject_iri)
+    for quad in store.quads_for_pattern(subject, None, None, graph_name):
+        g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
+    return g
+
+
 def _named_graph(store: Store, db: str, graph: str) -> Graph:
     g = Graph()
     graph_node = NamedNode(_graph_iri(db, graph))
@@ -244,11 +336,39 @@ def _db_graph(store: Store, db: str) -> Graph:
     return g
 
 
+def _system_graph() -> Graph:
+    _ensure_system_metadata_seeded()
+    store = _system_store()
+    g = _subject_graph(store, _system_iri(), None)
+    system = URIRef(_system_iri())
+    if DATA_DIR.exists():
+        for child in sorted(DATA_DIR.iterdir(), key=lambda p: p.name):
+            if child.is_dir() and child.name != SYSTEM_DB_NAME:
+                g.add((system, URIRef(HAS_PART_PREDICATE), URIRef(_db_iri(child.name))))
+    return g
+
+
 def _graph_exists(store: Store, db: str, graph: str) -> bool:
     graph_node = NamedNode(_graph_iri(db, graph))
     for _ in store.quads_for_pattern(None, None, None, graph_node):
         return True
     return False
+
+
+def _delete_graph(store: Store, db: str, graph: str) -> tuple[int, int]:
+    graph_node = NamedNode(_graph_iri(db, graph))
+    graph_quads = list(store.quads_for_pattern(None, None, None, graph_node))
+    for quad in graph_quads:
+        store.remove(quad)
+
+    link_deleted = _delete_triples(
+        store,
+        subject=_db_iri(db),
+        predicate=HAS_PART_PREDICATE,
+        obj={"type": "iri", "value": _graph_iri(db, graph)},
+        graph_iri=None,
+    )
+    return len(graph_quads), link_deleted
 
 
 def _insert_triple(
@@ -264,14 +384,124 @@ def _insert_triple(
     store.add(quad)
 
 
+def _delete_triples(
+    store: Store,
+    *,
+    subject: str,
+    predicate: str | None,
+    obj: Any | None,
+    graph_iri: str | None,
+) -> int:
+    graph_name = NamedNode(graph_iri) if graph_iri else DefaultGraph()
+    p_term = NamedNode(predicate) if predicate else None
+    o_term = _parse_object(obj) if obj is not None else None
+    s_term = NamedNode(subject)
+    to_remove = list(store.quads_for_pattern(s_term, p_term, o_term, graph_name))
+    for quad in to_remove:
+        store.remove(quad)
+    return len(to_remove)
+
+
 def _link_db_graph(store: Store, db: str, graph: str) -> None:
     _insert_triple(
         store,
         subject=_db_iri(db),
-        predicate=HAS_GRAPH_PREDICATE,
+        predicate=HAS_PART_PREDICATE,
         obj={"type": "iri", "value": _graph_iri(db, graph)},
         graph_iri=None,
     )
+
+
+def _link_db_system(store: Store, db: str) -> None:
+    _insert_triple(
+        store,
+        subject=_db_iri(db),
+        predicate=IS_PART_OF_PREDICATE,
+        obj={"type": "iri", "value": _system_iri()},
+        graph_iri=None,
+    )
+
+
+def _link_graph_db(store: Store, db: str, graph: str) -> None:
+    _insert_triple(
+        store,
+        subject=_graph_iri(db, graph),
+        predicate=IS_PART_OF_PREDICATE,
+        obj={"type": "iri", "value": _db_iri(db)},
+        graph_iri=_graph_iri(db, graph),
+    )
+
+
+def _add_db_type(store: Store, db: str) -> None:
+    _insert_triple(
+        store,
+        subject=_db_iri(db),
+        predicate=RDF_TYPE_PREDICATE,
+        obj={"type": "iri", "value": DB_TYPE_IRI},
+        graph_iri=None,
+    )
+
+
+def _add_graph_type(store: Store, db: str, graph: str) -> None:
+    _insert_triple(
+        store,
+        subject=_graph_iri(db, graph),
+        predicate=RDF_TYPE_PREDICATE,
+        obj={"type": "iri", "value": GRAPH_TYPE_IRI},
+        graph_iri=_graph_iri(db, graph),
+    )
+
+
+def _system_store() -> Store:
+    return _ensure_store(SYSTEM_DB_NAME)
+
+
+def _ensure_system_metadata_seeded() -> None:
+    global _SYSTEM_METADATA_SEEDED
+    with _SYSTEM_METADATA_SEEDED_LOCK:
+        if _SYSTEM_METADATA_SEEDED:
+            return
+        store = _system_store()
+        _insert_triple(
+            store,
+            subject=_system_iri(),
+            predicate=RDF_TYPE_PREDICATE,
+            obj={"type": "iri", "value": SYSTEM_TYPE_IRI},
+            graph_iri=None,
+        )
+        _insert_triple(
+            store,
+            subject=_system_iri(),
+            predicate=RDFS_LABEL_PREDICATE,
+            obj={"type": "literal", "value": "Resolvable URI System"},
+            graph_iri=None,
+        )
+        _SYSTEM_METADATA_SEEDED = True
+
+
+def _ensure_def_seeded() -> None:
+    global _DEF_SEEDED
+    with _DEF_SEEDED_LOCK:
+        if _DEF_SEEDED:
+            return
+        store = _system_store()
+        seed = [
+            (_def_iri("System"), RDF_TYPE_PREDICATE, {"type": "iri", "value": RDFS_CLASS_IRI}),
+            (_def_iri("System"), RDFS_LABEL_PREDICATE, {"type": "literal", "value": "System"}),
+            (_def_iri("Database"), RDF_TYPE_PREDICATE, {"type": "iri", "value": RDFS_CLASS_IRI}),
+            (_def_iri("Database"), RDFS_LABEL_PREDICATE, {"type": "literal", "value": "Database"}),
+            (_def_iri("Graph"), RDF_TYPE_PREDICATE, {"type": "iri", "value": RDFS_CLASS_IRI}),
+            (_def_iri("Graph"), RDFS_LABEL_PREDICATE, {"type": "literal", "value": "Graph"}),
+        ]
+        for subject, predicate, obj in seed:
+            _insert_triple(
+                store,
+                subject=subject,
+                predicate=predicate,
+                obj=obj,
+                graph_iri=DEF_GRAPH_IRI,
+            )
+        _DEF_SEEDED = True
 
 
 def _predicate_from_query_key(key: str) -> str:
@@ -307,7 +537,11 @@ def _apply_get_test_writes(request: Request, *, db: str, graph: str | None = Non
     if not params:
         return
 
+    db_created = not _db_exists(db)
     store = _ensure_store(db)
+    if db_created:
+        _add_db_type(store, db)
+        _link_db_system(store, db)
     graph_created = False
     if graph is not None:
         graph_created = not _graph_exists(store, db, graph)
@@ -330,6 +564,8 @@ def _apply_get_test_writes(request: Request, *, db: str, graph: str | None = Non
             graph_iri=graph_iri,
         )
     if graph_created:
+        _add_graph_type(store, db, graph)
+        _link_graph_db(store, db, graph)
         _link_db_graph(store, db, graph)
 
 
@@ -378,36 +614,207 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 @app.get("/id/{db}")
 def get_db(db: str, request: Request):
+    if TEST_MODE_GET_WRITE and not _db_exists(db):
+        store = _ensure_store(db)
+        _add_db_type(store, db)
+        _link_db_system(store, db)
+        _insert_triple(
+            store,
+            subject=_db_iri(db),
+            predicate="http://www.w3.org/2000/01/rdf-schema#label",
+            obj={"type": "literal", "value": db},
+            graph_iri=None,
+        )
     _apply_get_test_writes(request, db=db)
     if not _db_exists(db):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
 
-    g = _db_graph(_open_store(db), db)
+    store = _open_store(db)
+    _add_db_type(store, db)
+    g = _db_graph(store, db)
     if len(g) == 0:
         raise APIError(404, "db_description_not_found", "Geen triples gevonden voor database in default graph")
 
+    redirect = _viewer_redirect_if_needed(request)
+    if redirect is not None:
+        return redirect
     body, media_type = _serialize_graph(g, _determine_format(request))
     return Response(content=body, media_type=media_type)
+
+
+@app.get("/id")
+def get_system(request: Request):
+    redirect = _viewer_redirect_if_needed(request)
+    if redirect is not None:
+        return redirect
+    g = _system_graph()
+    body, media_type = _serialize_graph(g, _determine_format(request))
+    return Response(content=body, media_type=media_type)
+
+
+@app.post("/id")
+async def post_system(request: Request):
+    payload = await _json_or_empty(request)
+    p = payload.get("p")
+    o = payload.get("o")
+    if not p or o is None:
+        raise APIError(400, "invalid_payload", "Payload vereist minimaal `p` en `o`")
+    _ensure_system_metadata_seeded()
+    store = _system_store()
+    _insert_triple(
+        store,
+        subject=_system_iri(),
+        predicate=p,
+        obj=o,
+        graph_iri=None,
+    )
+    return _pretty_json_response({"system": _system_iri(), "created": True}, status_code=201)
+
+
+@app.delete("/id")
+async def delete_system_triples(request: Request):
+    payload = await _json_or_empty(request)
+    p = payload.get("p")
+    if not p:
+        raise APIError(400, "invalid_payload", "Payload vereist `p`")
+    o = payload.get("o")
+    _ensure_system_metadata_seeded()
+    store = _system_store()
+    deleted = _delete_triples(
+        store,
+        subject=_system_iri(),
+        predicate=p,
+        obj=o,
+        graph_iri=None,
+    )
+    return _pretty_json_response(
+        {"system": _system_iri(), "deleted_triples": deleted, "mode": "triple_delete"},
+        status_code=200,
+    )
+
+
+@app.get("/def")
+def get_definitions(request: Request):
+    redirect = _viewer_redirect_if_needed(request)
+    if redirect is not None:
+        return redirect
+    _ensure_def_seeded()
+    store = _system_store()
+    g = Graph()
+    graph_node = NamedNode(DEF_GRAPH_IRI)
+    for quad in store.quads_for_pattern(None, None, None, graph_node):
+        g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
+    body, media_type = _serialize_graph(g, _determine_format(request))
+    return Response(content=body, media_type=media_type)
+
+
+@app.get("/def/{term:path}")
+def get_definition(term: str, request: Request):
+    _ensure_def_seeded()
+    store = _system_store()
+    g = _subject_graph(store, _def_iri(term), DEF_GRAPH_IRI)
+    if len(g) == 0:
+        raise APIError(404, "definition_not_found", f"Definitie `{term}` niet gevonden")
+    redirect = _viewer_redirect_if_needed(request)
+    if redirect is not None:
+        return redirect
+    body, media_type = _serialize_graph(g, _determine_format(request))
+    return Response(content=body, media_type=media_type)
+
+
+@app.post("/def/{term:path}")
+async def post_definition(term: str, request: Request):
+    _ensure_def_seeded()
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise APIError(400, "invalid_payload", "Payload moet JSON object zijn")
+    p = payload.get("p")
+    o = payload.get("o")
+    if not p or o is None:
+        raise APIError(400, "invalid_payload", "Payload vereist minimaal `p` en `o`")
+    store = _system_store()
+    _insert_triple(
+        store,
+        subject=_def_iri(term),
+        predicate=p,
+        obj=o,
+        graph_iri=DEF_GRAPH_IRI,
+    )
+    return _pretty_json_response({"term": term, "created": True}, status_code=201)
 
 
 @app.post("/id/{db}")
 async def post_db(db: str, request: Request):
     payload = await _json_or_empty(request)
-    label = payload.get("label", db)
 
     created = not _db_exists(db)
     store = _ensure_store(db)
+    _add_db_type(store, db)
+    if created:
+        _link_db_system(store, db)
 
+    p = payload.get("p")
+    o = payload.get("o")
+    if p and o is not None:
+        _insert_triple(
+            store,
+            subject=_db_iri(db),
+            predicate=p,
+            obj=o,
+            graph_iri=None,
+        )
+        status = 201 if created else 200
+        return _pretty_json_response(
+            {"db": db, "created": created, "triple_created": True, "mode": "triple_create"},
+            status_code=status,
+        )
+
+    label = payload.get("label", db)
     _insert_triple(
         store,
         subject=_db_iri(db),
-        predicate="http://www.w3.org/2000/01/rdf-schema#label",
+        predicate=RDFS_LABEL_PREDICATE,
         obj={"type": "literal", "value": label},
         graph_iri=None,
     )
 
     status = 201 if created else 200
     return _pretty_json_response({"db": db, "created": created}, status_code=status)
+
+
+@app.delete("/id/{db}")
+async def delete_db(db: str, request: Request):
+    payload = await _json_or_empty(request)
+    if "p" in payload:
+        if not _db_exists(db):
+            raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
+        p = payload.get("p")
+        if not p:
+            raise APIError(400, "invalid_payload", "Payload vereist `p` voor triple-delete")
+        o = payload.get("o")
+        store = _open_store(db)
+        deleted = _delete_triples(
+            store,
+            subject=_db_iri(db),
+            predicate=p,
+            obj=o,
+            graph_iri=None,
+        )
+        return _pretty_json_response(
+            {"db": db, "deleted_triples": deleted, "mode": "triple_delete"},
+            status_code=200,
+        )
+    cascade = payload.get("cascade", True)
+    if not isinstance(cascade, bool):
+        raise APIError(400, "invalid_payload", "`cascade` moet boolean zijn")
+    if not cascade:
+        raise APIError(
+            400,
+            "cascade_required",
+            "Alleen cascade delete wordt ondersteund voor databases",
+        )
+    _delete_db(db)
+    return _pretty_json_response({"db": db, "deleted": True, "cascade": True}, status_code=200)
 
 
 @app.get("/id/{db}/{graph}")
@@ -421,6 +828,9 @@ def get_graph(db: str, graph: str, request: Request):
     if len(g) == 0:
         raise APIError(404, "graph_not_found", f"Graph `{graph}` bestaat niet of bevat geen triples")
 
+    redirect = _viewer_redirect_if_needed(request)
+    if redirect is not None:
+        return redirect
     body, media_type = _serialize_graph(g, _determine_format(request))
     return Response(content=body, media_type=media_type)
 
@@ -432,15 +842,20 @@ async def post_graph(db: str, graph: str, request: Request):
 
     db_created = not _db_exists(db)
     store = _ensure_store(db)
+    _add_db_type(store, db)
+    if db_created:
+        _link_db_system(store, db)
     existed = _graph_exists(store, db, graph)
 
     _insert_triple(
         store,
         subject=_graph_iri(db, graph),
-        predicate="http://www.w3.org/2000/01/rdf-schema#label",
+        predicate=RDFS_LABEL_PREDICATE,
         obj={"type": "literal", "value": label},
         graph_iri=_graph_iri(db, graph),
     )
+    _add_graph_type(store, db, graph)
+    _link_graph_db(store, db, graph)
     if not existed:
         _link_db_graph(store, db, graph)
 
@@ -448,6 +863,35 @@ async def post_graph(db: str, graph: str, request: Request):
     return _pretty_json_response(
         {"db": db, "graph": graph, "db_created": db_created, "created": not existed},
         status_code=status,
+    )
+
+
+@app.delete("/id/{db}/{graph}")
+async def delete_graph(db: str, graph: str, request: Request):
+    if not _db_exists(db):
+        raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
+    payload = await _json_or_empty(request)
+    cascade = payload.get("cascade", True)
+    if not isinstance(cascade, bool):
+        raise APIError(400, "invalid_payload", "`cascade` moet boolean zijn")
+    if not cascade:
+        raise APIError(400, "cascade_required", "Alleen cascade delete wordt ondersteund voor graphs")
+
+    store = _open_store(db)
+    if not _graph_exists(store, db, graph):
+        raise APIError(404, "graph_not_found", f"Graph `{graph}` bestaat niet")
+
+    graph_deleted, link_deleted = _delete_graph(store, db, graph)
+    return _pretty_json_response(
+        {
+            "db": db,
+            "graph": graph,
+            "deleted": True,
+            "cascade": True,
+            "deleted_graph_triples": graph_deleted,
+            "deleted_db_links": link_deleted,
+        },
+        status_code=200,
     )
 
 
@@ -462,6 +906,9 @@ def get_resource(db: str, graph: str, resource: str, request: Request):
     if len(g) == 0:
         raise APIError(404, "resource_not_found", f"Resource `{resource}` niet gevonden")
 
+    redirect = _viewer_redirect_if_needed(request)
+    if redirect is not None:
+        return redirect
     body, media_type = _serialize_graph(g, _determine_format(request))
     return Response(content=body, media_type=media_type)
 
@@ -479,6 +926,9 @@ async def post_resource(db: str, graph: str, resource: str, request: Request):
 
     db_created = not _db_exists(db)
     store = _ensure_store(db)
+    _add_db_type(store, db)
+    if db_created:
+        _link_db_system(store, db)
     graph_created = not _graph_exists(store, db, graph)
 
     _insert_triple(
@@ -488,6 +938,8 @@ async def post_resource(db: str, graph: str, resource: str, request: Request):
         obj=o,
         graph_iri=_graph_iri(db, graph),
     )
+    _add_graph_type(store, db, graph)
+    _link_graph_db(store, db, graph)
     if graph_created:
         _link_db_graph(store, db, graph)
 
@@ -501,6 +953,35 @@ async def post_resource(db: str, graph: str, resource: str, request: Request):
             "created": True,
         },
         status_code=201,
+    )
+
+
+@app.delete("/id/{db}/{graph}/{resource:path}")
+async def delete_resource_triples(db: str, graph: str, resource: str, request: Request):
+    if not _db_exists(db):
+        raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
+    payload = await _json_or_empty(request)
+    p = payload.get("p")
+    if not p:
+        raise APIError(400, "invalid_payload", "Payload vereist `p`")
+    o = payload.get("o")
+    store = _open_store(db)
+    deleted = _delete_triples(
+        store,
+        subject=_resource_iri(db, graph, resource),
+        predicate=p,
+        obj=o,
+        graph_iri=_graph_iri(db, graph),
+    )
+    return _pretty_json_response(
+        {
+            "db": db,
+            "graph": graph,
+            "resource": resource,
+            "deleted_triples": deleted,
+            "mode": "triple_delete",
+        },
+        status_code=200,
     )
 
 

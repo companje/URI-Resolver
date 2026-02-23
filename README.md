@@ -13,9 +13,14 @@ Deze service maakt URI's resolvebaar binnen een namespace, met:
 ## URI-model
 
 Alle resolvable URI's zitten onder `/id`:
+- `/id`: systeemresource met overzicht van databases
 - `/id/<db>`: database-resource (metadata in default graph)
 - `/id/<db>/<graph>`: named graph
 - `/id/<db>/<graph>/<resource>`: resource binnen die graph
+
+Vocabulary/definitie URI's zitten onder `/def`:
+- `/def`: overzicht van definities
+- `/def/<term>`: definitie-resource (bijv. `/def/Database`)
 
 Trailing slashes worden genegeerd:
 - `/id/mijndb/` en `/id/mijndb` zijn equivalent
@@ -26,10 +31,98 @@ Trailing slashes worden genegeerd:
 ### `GET /id/<db>`
 Leest triples over de database uit de default graph.
 Bevat o.a. links naar bestaande graphs via predicate:
-`https://kvan-todb.hualab.nl/def/hasGraph`.
+`https://schema.org/hasPart` (`sdo:hasPart`).
+
+### `GET /id`
+Leest systeemmetadata en bevat links naar databases via predicate:
+`https://schema.org/hasPart` (`sdo:hasPart`).
+Deze system-resource wordt on-the-fly opgebouwd en bevat ook:
+`rdf:type https://kvan-todb.hualab.nl/def/System`.
+
+### `POST /id`
+Voegt een triple toe aan de systeemresource (`https://kvan-todb.hualab.nl/id`).
+
+Body:
+```json
+{
+  "p": "http://www.w3.org/2000/01/rdf-schema#label",
+  "o": "Nieuwe label"
+}
+```
+
+### `DELETE /id`
+Verwijdert triples op de systeemresource.
+
+Body:
+```json
+{
+  "p": "http://www.w3.org/2000/01/rdf-schema#label",
+  "o": "Resolvable URI System"
+}
+```
+
+Gedrag:
+- met `p` + `o`: verwijder exact matchende triple(s)
+- met alleen `p`: verwijder alle waarden voor die predicate
+
+### `GET /def`
+Leest alle definitie-triples uit de beheerde `def` graph.
+
+### `GET /def/<term>`
+Leest triples van een specifieke definitie, bijvoorbeeld:
+`/def/Database`.
+
+### `POST /def/<term>`
+Voegt triples toe aan een definitie-resource in de `def` graph.
+
+Body (verplicht):
+```json
+{
+  "p": "http://www.w3.org/2000/01/rdf-schema#label",
+  "o": "Database"
+}
+```
 
 ### `POST /id/<db>`
 Maakt database aan als die nog niet bestaat en voegt (minimaal) een label toe.
+Bij nieuwe database wordt ook gezet:
+`rdf:type https://kvan-todb.hualab.nl/def/Database`.
+En:
+`sdo:isPartOf https://kvan-todb.hualab.nl/id`.
+
+Je kunt ook direct een custom triple toevoegen op het db-subject met:
+```json
+{
+  "p": "http://www.w3.org/2000/01/rdf-schema#label",
+  "o": "xNL-NmRAN_70"
+}
+```
+
+### `DELETE /id/<db>`
+Ondersteunt twee modi:
+- Database verwijderen (cascade): verwijdert de volledige database inclusief alle graphs/triples.
+- Triple verwijderen op database-subject: met `p` (en optioneel `o`) verwijdert triples van subject `/id/<db>` in de default graph.
+
+Body (optioneel):
+```json
+{
+  "cascade": true
+}
+```
+
+Opmerking:
+- Alleen cascade delete wordt ondersteund.
+- `cascade` default is `true`.
+
+Triple-delete voorbeeld op db-level:
+```json
+{
+  "p": "http://www.w3.org/2000/01/rdf-schema#label",
+  "o": { "type": "literal", "value": "oude naam", "lang": "nl" }
+}
+```
+
+Als `o` wordt weggelaten, worden alle waarden voor die `p` verwijderd.
 
 Body (optioneel):
 ```json
@@ -44,6 +137,21 @@ Leest alle triples uit de named graph.
 ### `POST /id/<db>/<graph>`
 Maakt graph aan als die nog niet bestaat en voegt (minimaal) een label toe.
 Als database nog niet bestaat, wordt die ook automatisch aangemaakt.
+Bij nieuwe graph wordt ook gezet:
+`rdf:type https://kvan-todb.hualab.nl/def/Graph`.
+En:
+`sdo:isPartOf https://kvan-todb.hualab.nl/id/<db>`.
+
+### `DELETE /id/<db>/<graph>`
+Verwijdert de volledige graph (alle triples in die named graph) en haalt de
+`sdo:hasPart` link vanaf de database weg.
+
+Body (optioneel):
+```json
+{
+  "cascade": true
+}
+```
 
 Body (optioneel):
 ```json
@@ -67,6 +175,21 @@ Body (verplicht):
   "o": "hoi"
 }
 ```
+
+### `DELETE /id/<db>/<graph>/<resource>`
+Verwijdert triples op een resource-subject binnen de named graph.
+
+Body:
+```json
+{
+  "p": "http://www.w3.org/2000/01/rdf-schema#label",
+  "o": "oude waarde"
+}
+```
+
+Gedrag:
+- met `p` + `o`: verwijder exact matchende triple(s)
+- met alleen `p`: verwijder alle waarden voor die predicate op deze resource
 
 Ondersteunde `o`-vormen:
 - string: plain literal
@@ -95,6 +218,15 @@ Representatiekeuze:
 - `.json` extensie => JSON(-LD)
 
 Dit geldt ook voor foutmeldingen.
+
+Opmerking: in JSON-LD kan `rdf:type` verschijnen als `@type`.
+
+Viewer redirect:
+- Als er geen expliciete RDF content negotiation is (en geen `.ttl`/`.json`),
+  redirectt de resolver naar de viewer met `303 See Other`.
+- Target is: `VIEWER_BASE?uri=<de-opgevraagde-id-uri>`.
+- `VIEWER_BASE` default: `https://kvan-todb.hualab.nl/viewer` (configureerbaar via env var).
+- In `TEST_MODE_GET_WRITE=true` is deze redirect uitgeschakeld.
 
 Voorbeelden:
 - `GET /id/mijndb/mijngraph/mijnresource` -> JSON-LD (default)
@@ -138,6 +270,7 @@ Gedrag in deze modus:
 - Zonder prefix wordt predicate: `https://kvan-todb.hualab.nl/def/<key>`.
 - Met prefix (`prefix:local`) wordt predicate opgelost via prefix map.
 - Als db (of graph/resource context) nog niet bestaat, wordt die bij deze write flow aangemaakt.
+- Extra: `GET /id/<db>` zonder query params maakt in testmodus ook direct de database aan.
 
 Voorbeelden:
 ```text
@@ -216,4 +349,16 @@ curl -i 'https://kvan-todb.hualab.nl/id/mijndb/mijngraph/mijnresource.ttl'
 Niet-bestaande graph als Turtle-fout:
 ```bash
 curl -i 'https://kvan-todb.hualab.nl/id/mijndb/bestaatniet.ttl'
+```
+
+Definitie label toevoegen:
+```bash
+curl -i -X POST 'https://kvan-todb.hualab.nl/def/Database' \
+  -H 'Content-Type: application/json' \
+  -d '{"p":"http://www.w3.org/2000/01/rdf-schema#label","o":{"type":"literal","value":"Database","lang":"nl"}}'
+```
+
+Definitie opvragen als Turtle:
+```bash
+curl -i 'https://kvan-todb.hualab.nl/def/Database.ttl'
 ```
