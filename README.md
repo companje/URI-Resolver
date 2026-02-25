@@ -362,3 +362,19 @@ Definitie opvragen als Turtle:
 ```bash
 curl -i 'https://kvan-todb.hualab.nl/def/Database.ttl'
 ```
+
+## Export all graphs
+
+Exporteer alle databases met per database-map Turtle-bestanden voor:
+- default graph (`default.ttl`)
+- elke named graph (`<graphnaam>.ttl`)
+
+Run:
+```bash
+uv run python scripts/export_all_graphs.py --data-dir app/data --output-dir exports
+```
+
+Optioneel interne system-store meenemen:
+```bash
+uv run python scripts/export_all_graphs.py --data-dir app/data --output-dir exports --include-system-db
+```

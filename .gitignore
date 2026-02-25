@@ -2,3 +2,4 @@
 /app/data
 /resolvable_uris.egg-info
 .DS_Store
+/exports
