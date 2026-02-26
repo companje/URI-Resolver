@@ -83,6 +83,24 @@ Body (verplicht):
 }
 ```
 
+### `DELETE /def/<term>`
+Verwijdert triples op een definitie-resource in de `def` graph.
+
+Body:
+```json
+{
+  "p": "http://www.w3.org/2000/01/rdf-schema#label",
+  "o": "Database"
+}
+```
+
+Gedrag:
+- met `p` + `o`: verwijder exact matchende triple(s)
+- met alleen `p`: verwijder alle waarden voor die predicate
+
+### `POST /def` en `DELETE /def`
+Zelfde triple-create/triple-delete maar op subject `https://kvan-todb.hualab.nl/def`.
+
 ### `POST /id/<db>`
 Maakt database aan als die nog niet bestaat en voegt (minimaal) een label toe.
 Bij nieuwe database wordt ook gezet:
@@ -134,6 +152,22 @@ Body (optioneel):
 ### `GET /id/<db>/<graph>`
 Leest alle triples uit de named graph.
 
+Optioneel resolve-mechanisme (JSON-LD uitbreiden met gerelateerde nodes):
+- `resolve`: JSON array van predicate IRIs
+- `resolve_depth`: default `1`
+- `resolve_direction`: `out|in|both` (default `out`)
+- `resolve_limit`: default `1000`
+- `resolve_include_root`: default `true`
+
+Voorbeeld:
+```text
+/id/bs2324-deel1/scans?resolve=["https://schema.org/hasPart","https://schema.org/isPartOf","https://schema.org/text"]&resolve_direction=both&resolve_depth=4
+```
+
+Gedrag:
+- response volgt normale content negotiation (`.ttl`, `.json`, `Accept`), ook met `resolve`;
+- extra nodes/triples worden server-side toegevoegd op basis van de opgegeven predicates.
+
 ### `POST /id/<db>/<graph>`
 Maakt graph aan als die nog niet bestaat en voegt (minimaal) een label toe.
 Als database nog niet bestaat, wordt die ook automatisch aangemaakt.
@@ -162,6 +196,7 @@ Body (optioneel):
 
 ### `GET /id/<db>/<graph>/<resource>`
 Leest triples van het subject `<resource>` binnen de opgegeven graph.
+Ondersteunt dezelfde `resolve*` query-params als `GET /id/<db>/<graph>`.
 
 ### `POST /id/<db>/<graph>/<resource>`
 Voegt een triple toe voor die resource.
@@ -378,3 +413,29 @@ Optioneel interne system-store meenemen:
 ```bash
 uv run python scripts/export_all_graphs.py --data-dir app/data --output-dir exports --include-system-db
 ```
+
+## Relations API (voor viewer)
+
+### `GET /api/relations/incoming`
+Query params:
+- `uri` (verplicht)
+- `predicates` (optioneel, comma-separated IRIs)
+- `graph` (optioneel)
+- `offset` (default `0`)
+- `limit` (default `100`, max `1000`)
+
+Response bevat altijd `graph` per hit.
+
+### `GET /api/relations/neighbors`
+Query params:
+- `uri` (verplicht)
+- `direction` = `out|in|both` (default `both`)
+- `predicates` (optioneel)
+- `graph` (optioneel)
+- `offset`, `limit`
+
+Response bevat `direction` en `graph` per hit.
+
+Defaults voor predicates (als `predicates` ontbreekt):
+- `https://schema.org/hasPart`
+- `https://schema.org/isPartOf`

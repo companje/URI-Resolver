@@ -10,7 +10,7 @@ from threading import Lock
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import RedirectResponse, Response
 from pyoxigraph import DefaultGraph, Literal, NamedNode, Quad, Store
 from rdflib import BNode, Graph, Literal as RdfLiteral, Namespace, URIRef
@@ -32,6 +32,7 @@ COMMON_PREFIXES = {
 }
 HAS_PART_PREDICATE = "https://schema.org/hasPart"
 IS_PART_OF_PREDICATE = "https://schema.org/isPartOf"
+DEFAULT_RELATION_PREDICATES = (HAS_PART_PREDICATE, IS_PART_OF_PREDICATE)
 RDF_TYPE_PREDICATE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 DB_TYPE_IRI = f"{BASE_PUBLIC}/def/Database"
 GRAPH_TYPE_IRI = f"{BASE_PUBLIC}/def/Graph"
@@ -402,6 +403,292 @@ def _delete_triples(
     return len(to_remove)
 
 
+def _db_names(*, include_system: bool = False) -> list[str]:
+    if not DATA_DIR.exists():
+        return []
+    names = [p.name for p in DATA_DIR.iterdir() if p.is_dir()]
+    if not include_system:
+        names = [n for n in names if n != SYSTEM_DB_NAME]
+    return sorted(names)
+
+
+def _graph_name_to_str(graph_name: Any) -> str | None:
+    cls_name = graph_name.__class__.__name__
+    if cls_name == "DefaultGraph":
+        return None
+    if cls_name == "NamedNode":
+        return getattr(graph_name, "value", str(graph_name).strip("<>"))
+    return str(graph_name)
+
+
+def _term_to_api_str(term: Any) -> str:
+    cls_name = term.__class__.__name__
+    if cls_name == "NamedNode":
+        return getattr(term, "value", str(term).strip("<>"))
+    if cls_name == "BlankNode":
+        return f"_:{getattr(term, 'value', str(term))}"
+    if cls_name == "Literal":
+        return getattr(term, "value", str(term))
+    return str(term)
+
+
+def _parse_predicates_param(predicates: str | None) -> set[str] | None:
+    if not predicates:
+        return None
+    values = {p.strip() for p in predicates.split(",") if p.strip()}
+    return values or None
+
+
+def _expand_prefixed_predicate(value: str) -> str:
+    if ":" not in value:
+        return value
+    prefix, local = value.split(":", 1)
+    base = COMMON_PREFIXES.get(prefix)
+    if not base or not local:
+        return value
+    return f"{base}{local}"
+
+
+def _parse_resolve_predicates_param(resolve: str | None) -> set[str] | None:
+    if not resolve:
+        return None
+    try:
+        raw = json.loads(resolve)
+    except Exception:
+        raise APIError(
+            400,
+            "invalid_resolve",
+            "`resolve` moet JSON array zijn, bv [\"https://schema.org/text\"]",
+        )
+    if not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
+        raise APIError(400, "invalid_resolve", "`resolve` moet array van strings zijn")
+    values = {_expand_prefixed_predicate(v.strip()) for v in raw if v.strip()}
+    return values or None
+
+
+def _copy_graph(input_graph: Graph) -> Graph:
+    out = Graph()
+    for s, p, o in input_graph:
+        out.add((s, p, o))
+    return out
+
+
+def _add_subject_description(
+    *,
+    store: Store,
+    subject: NamedNode,
+    out_graph: Graph,
+    seen_triples: set[tuple[str, str, str]],
+    remaining_budget: int,
+) -> int:
+    if remaining_budget <= 0:
+        return 0
+    added = 0
+    for quad in store.quads_for_pattern(subject, None, None, None):
+        s = _term_to_rdflib(quad.subject)
+        p = _term_to_rdflib(quad.predicate)
+        o = _term_to_rdflib(quad.object)
+        key = (str(s), str(p), str(o))
+        if key in seen_triples:
+            continue
+        out_graph.add((s, p, o))
+        seen_triples.add(key)
+        added += 1
+        if added >= remaining_budget:
+            break
+    return added
+
+
+def _resolve_graph_neighbors(
+    *,
+    store: Store,
+    base_graph: Graph,
+    predicates: set[str],
+    direction: str,
+    depth: int,
+    limit: int,
+    include_root: bool,
+) -> Graph:
+    out_graph = _copy_graph(base_graph) if include_root else Graph()
+    seen_triples: set[tuple[str, str, str]] = {(str(s), str(p), str(o)) for s, p, o in out_graph}
+    start_nodes = {URIRef(str(s)) for s in set(base_graph.subjects()) if isinstance(s, URIRef)}
+    start_nodes.update({URIRef(str(o)) for o in set(base_graph.objects()) if isinstance(o, URIRef)})
+    frontier = {NamedNode(str(n)) for n in start_nodes}
+    visited_nodes = {str(n) for n in frontier}
+    remaining_budget = max(0, limit)
+
+    for _ in range(depth):
+        if not frontier or remaining_budget <= 0:
+            break
+        next_frontier: set[NamedNode] = set()
+        for node in frontier:
+            if remaining_budget <= 0:
+                break
+            if direction in {"out", "both"}:
+                for quad in store.quads_for_pattern(node, None, None, None):
+                    p_value = _term_to_api_str(quad.predicate)
+                    if p_value not in predicates:
+                        continue
+                    s = _term_to_rdflib(quad.subject)
+                    p = _term_to_rdflib(quad.predicate)
+                    o = _term_to_rdflib(quad.object)
+                    key = (str(s), str(p), str(o))
+                    if key not in seen_triples and remaining_budget > 0:
+                        out_graph.add((s, p, o))
+                        seen_triples.add(key)
+                        remaining_budget -= 1
+                    if quad.object.__class__.__name__ == "NamedNode":
+                        reached = NamedNode(_term_to_api_str(quad.object))
+                        if str(reached) not in visited_nodes:
+                            next_frontier.add(reached)
+                            visited_nodes.add(str(reached))
+                            used = _add_subject_description(
+                                store=store,
+                                subject=reached,
+                                out_graph=out_graph,
+                                seen_triples=seen_triples,
+                                remaining_budget=remaining_budget,
+                            )
+                            remaining_budget -= used
+
+            if direction in {"in", "both"}:
+                for quad in store.quads_for_pattern(None, None, node, None):
+                    p_value = _term_to_api_str(quad.predicate)
+                    if p_value not in predicates:
+                        continue
+                    s = _term_to_rdflib(quad.subject)
+                    p = _term_to_rdflib(quad.predicate)
+                    o = _term_to_rdflib(quad.object)
+                    key = (str(s), str(p), str(o))
+                    if key not in seen_triples and remaining_budget > 0:
+                        out_graph.add((s, p, o))
+                        seen_triples.add(key)
+                        remaining_budget -= 1
+                    if quad.subject.__class__.__name__ == "NamedNode":
+                        reached = NamedNode(_term_to_api_str(quad.subject))
+                        if str(reached) not in visited_nodes:
+                            next_frontier.add(reached)
+                            visited_nodes.add(str(reached))
+                            used = _add_subject_description(
+                                store=store,
+                                subject=reached,
+                                out_graph=out_graph,
+                                seen_triples=seen_triples,
+                                remaining_budget=remaining_budget,
+                            )
+                            remaining_budget -= used
+        frontier = next_frontier
+    return out_graph
+
+
+def _candidate_dbs_for_graph(graph: str | None) -> list[str]:
+    if not graph:
+        return _db_names()
+    prefix = f"{BASE_PUBLIC}/id/"
+    if graph.startswith(prefix):
+        rest = graph[len(prefix) :]
+        db_name = rest.split("/", 1)[0] if rest else ""
+        if db_name:
+            return [db_name]
+    return _db_names()
+
+
+def _collect_incoming_relations(
+    *,
+    uri: str,
+    predicate_filter: set[str] | None,
+    graph_filter: str | None,
+) -> list[dict[str, Any]]:
+    target = NamedNode(uri)
+    graph_node = NamedNode(graph_filter) if graph_filter else None
+    items: list[dict[str, Any]] = []
+    for db_name in _candidate_dbs_for_graph(graph_filter):
+        if not _db_exists(db_name):
+            continue
+        store = _open_store(db_name)
+        quads = store.quads_for_pattern(None, None, target, graph_node)
+        for quad in quads:
+            predicate = _term_to_api_str(quad.predicate)
+            if predicate_filter and predicate not in predicate_filter:
+                continue
+            graph_value = _graph_name_to_str(quad.graph_name)
+            if graph_filter and graph_value != graph_filter:
+                continue
+            items.append(
+                {
+                    "subject": _term_to_api_str(quad.subject),
+                    "predicate": predicate,
+                    "object": uri,
+                    "graph": graph_value,
+                }
+            )
+    items.sort(key=lambda i: (i["subject"], i["predicate"], i["graph"] or ""))
+    return items
+
+
+def _collect_neighbor_relations(
+    *,
+    uri: str,
+    direction: str,
+    predicate_filter: set[str] | None,
+    graph_filter: str | None,
+) -> list[dict[str, Any]]:
+    target = NamedNode(uri)
+    graph_node = NamedNode(graph_filter) if graph_filter else None
+    items: list[dict[str, Any]] = []
+    for db_name in _candidate_dbs_for_graph(graph_filter):
+        if not _db_exists(db_name):
+            continue
+        store = _open_store(db_name)
+
+        if direction in {"out", "both"}:
+            for quad in store.quads_for_pattern(target, None, None, graph_node):
+                predicate = _term_to_api_str(quad.predicate)
+                if predicate_filter and predicate not in predicate_filter:
+                    continue
+                graph_value = _graph_name_to_str(quad.graph_name)
+                if graph_filter and graph_value != graph_filter:
+                    continue
+                items.append(
+                    {
+                        "direction": "out",
+                        "subject": uri,
+                        "predicate": predicate,
+                        "object": _term_to_api_str(quad.object),
+                        "graph": graph_value,
+                    }
+                )
+
+        if direction in {"in", "both"}:
+            for quad in store.quads_for_pattern(None, None, target, graph_node):
+                predicate = _term_to_api_str(quad.predicate)
+                if predicate_filter and predicate not in predicate_filter:
+                    continue
+                graph_value = _graph_name_to_str(quad.graph_name)
+                if graph_filter and graph_value != graph_filter:
+                    continue
+                items.append(
+                    {
+                        "direction": "in",
+                        "subject": _term_to_api_str(quad.subject),
+                        "predicate": predicate,
+                        "object": uri,
+                        "graph": graph_value,
+                    }
+                )
+
+    items.sort(
+        key=lambda i: (
+            0 if i["direction"] == "out" else 1,
+            i["subject"],
+            i["predicate"],
+            i["object"],
+            i["graph"] or "",
+        )
+    )
+    return items
+
+
 def _link_db_graph(store: Store, db: str, graph: str) -> None:
     _insert_triple(
         store,
@@ -592,6 +879,17 @@ async def ttl_extension_override(request: Request, call_next):
 
 @app.exception_handler(APIError)
 async def api_error_handler(request: Request, exc: APIError):
+    redirectable_not_found_codes = {
+        "definition_not_found",
+        "db_not_found",
+        "db_description_not_found",
+        "graph_not_found",
+        "resource_not_found",
+    }
+    if request.method == "GET" and exc.code in redirectable_not_found_codes:
+        redirect = _viewer_redirect_if_needed(request)
+        if redirect is not None:
+            return redirect
     return _serialize_error(
         request,
         status_code=exc.status_code,
@@ -743,6 +1041,69 @@ async def post_definition(term: str, request: Request):
     return _pretty_json_response({"term": term, "created": True}, status_code=201)
 
 
+@app.delete("/def/{term:path}")
+async def delete_definition(term: str, request: Request):
+    payload = await _json_or_empty(request)
+    p = payload.get("p")
+    if not p:
+        raise APIError(400, "invalid_payload", "Payload vereist `p`")
+    o = payload.get("o")
+    _ensure_def_seeded()
+    store = _system_store()
+    deleted = _delete_triples(
+        store,
+        subject=_def_iri(term),
+        predicate=p,
+        obj=o,
+        graph_iri=DEF_GRAPH_IRI,
+    )
+    return _pretty_json_response(
+        {"term": term, "deleted_triples": deleted, "mode": "triple_delete"},
+        status_code=200,
+    )
+
+
+@app.post("/def")
+async def post_def_root(request: Request):
+    payload = await _json_or_empty(request)
+    p = payload.get("p")
+    o = payload.get("o")
+    if not p or o is None:
+        raise APIError(400, "invalid_payload", "Payload vereist minimaal `p` en `o`")
+    _ensure_def_seeded()
+    store = _system_store()
+    _insert_triple(
+        store,
+        subject=DEF_GRAPH_IRI,
+        predicate=p,
+        obj=o,
+        graph_iri=DEF_GRAPH_IRI,
+    )
+    return _pretty_json_response({"term": "def", "created": True}, status_code=201)
+
+
+@app.delete("/def")
+async def delete_def_root(request: Request):
+    payload = await _json_or_empty(request)
+    p = payload.get("p")
+    if not p:
+        raise APIError(400, "invalid_payload", "Payload vereist `p`")
+    o = payload.get("o")
+    _ensure_def_seeded()
+    store = _system_store()
+    deleted = _delete_triples(
+        store,
+        subject=DEF_GRAPH_IRI,
+        predicate=p,
+        obj=o,
+        graph_iri=DEF_GRAPH_IRI,
+    )
+    return _pretty_json_response(
+        {"term": "def", "deleted_triples": deleted, "mode": "triple_delete"},
+        status_code=200,
+    )
+
+
 @app.post("/id/{db}")
 async def post_db(db: str, request: Request):
     payload = await _json_or_empty(request)
@@ -818,7 +1179,16 @@ async def delete_db(db: str, request: Request):
 
 
 @app.get("/id/{db}/{graph}")
-def get_graph(db: str, graph: str, request: Request):
+def get_graph(
+    db: str,
+    graph: str,
+    request: Request,
+    resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
+    resolve_depth: int = Query(1, ge=1, le=10),
+    resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
+    resolve_limit: int = Query(1000, ge=1, le=50000),
+    resolve_include_root: bool = Query(True),
+):
     _apply_get_test_writes(request, db=db, graph=graph)
     if not _db_exists(db):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
@@ -828,10 +1198,24 @@ def get_graph(db: str, graph: str, request: Request):
     if len(g) == 0:
         raise APIError(404, "graph_not_found", f"Graph `{graph}` bestaat niet of bevat geen triples")
 
-    redirect = _viewer_redirect_if_needed(request)
-    if redirect is not None:
-        return redirect
-    body, media_type = _serialize_graph(g, _determine_format(request))
+    resolve_predicates = _parse_resolve_predicates_param(resolve)
+    if resolve_predicates:
+        g = _resolve_graph_neighbors(
+            store=store,
+            base_graph=g,
+            predicates=resolve_predicates,
+            direction=resolve_direction,
+            depth=resolve_depth,
+            limit=resolve_limit,
+            include_root=resolve_include_root,
+        )
+
+    if resolve is None:
+        redirect = _viewer_redirect_if_needed(request)
+        if redirect is not None:
+            return redirect
+    response_format = _determine_format(request)
+    body, media_type = _serialize_graph(g, response_format)
     return Response(content=body, media_type=media_type)
 
 
@@ -896,7 +1280,17 @@ async def delete_graph(db: str, graph: str, request: Request):
 
 
 @app.get("/id/{db}/{graph}/{resource:path}")
-def get_resource(db: str, graph: str, resource: str, request: Request):
+def get_resource(
+    db: str,
+    graph: str,
+    resource: str,
+    request: Request,
+    resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
+    resolve_depth: int = Query(1, ge=1, le=10),
+    resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
+    resolve_limit: int = Query(1000, ge=1, le=50000),
+    resolve_include_root: bool = Query(True),
+):
     _apply_get_test_writes(request, db=db, graph=graph, resource=resource)
     if not _db_exists(db):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
@@ -906,9 +1300,22 @@ def get_resource(db: str, graph: str, resource: str, request: Request):
     if len(g) == 0:
         raise APIError(404, "resource_not_found", f"Resource `{resource}` niet gevonden")
 
-    redirect = _viewer_redirect_if_needed(request)
-    if redirect is not None:
-        return redirect
+    resolve_predicates = _parse_resolve_predicates_param(resolve)
+    if resolve_predicates:
+        g = _resolve_graph_neighbors(
+            store=store,
+            base_graph=g,
+            predicates=resolve_predicates,
+            direction=resolve_direction,
+            depth=resolve_depth,
+            limit=resolve_limit,
+            include_root=resolve_include_root,
+        )
+
+    if resolve is None:
+        redirect = _viewer_redirect_if_needed(request)
+        if redirect is not None:
+            return redirect
     body, media_type = _serialize_graph(g, _determine_format(request))
     return Response(content=body, media_type=media_type)
 
@@ -982,6 +1389,63 @@ async def delete_resource_triples(db: str, graph: str, resource: str, request: R
             "mode": "triple_delete",
         },
         status_code=200,
+    )
+
+
+@app.get("/api/relations/incoming")
+def api_relations_incoming(
+    uri: str = Query(..., description="Target IRI"),
+    predicates: str | None = Query(None, description="Comma-separated predicate IRIs"),
+    graph: str | None = Query(None, description="Named graph IRI filter"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    predicate_filter = _parse_predicates_param(predicates)
+    if predicate_filter is None:
+        predicate_filter = set(DEFAULT_RELATION_PREDICATES)
+    items = _collect_incoming_relations(uri=uri, predicate_filter=predicate_filter, graph_filter=graph)
+    total = len(items)
+    page = items[offset : offset + limit]
+    return _pretty_json_response(
+        {
+            "uri": uri,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "items": page,
+        }
+    )
+
+
+@app.get("/api/relations/neighbors")
+def api_relations_neighbors(
+    uri: str = Query(..., description="Target IRI"),
+    direction: str = Query("both", pattern="^(out|in|both)$"),
+    predicates: str | None = Query(None, description="Comma-separated predicate IRIs"),
+    graph: str | None = Query(None, description="Named graph IRI filter"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    predicate_filter = _parse_predicates_param(predicates)
+    if predicate_filter is None:
+        predicate_filter = set(DEFAULT_RELATION_PREDICATES)
+    items = _collect_neighbor_relations(
+        uri=uri,
+        direction=direction,
+        predicate_filter=predicate_filter,
+        graph_filter=graph,
+    )
+    total = len(items)
+    page = items[offset : offset + limit]
+    return _pretty_json_response(
+        {
+            "uri": uri,
+            "direction": direction,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "items": page,
+        }
     )
 
 
