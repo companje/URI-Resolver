@@ -1285,6 +1285,47 @@ def get_graph(
 @app.post("/id/{db}/{graph}")
 async def post_graph(db: str, graph: str, request: Request):
     payload = await _json_or_empty(request)
+    p = payload.get("p")
+    o = payload.get("o")
+
+    if p or o is not None:
+        if not p or o is None:
+            raise APIError(400, "invalid_payload", "Payload vereist minimaal `p` en `o`")
+        db_created = not _db_exists(db)
+        store = _ensure_store(db)
+        _add_db_type(store, db)
+        if db_created:
+            _link_db_system(store, db)
+        existed = _graph_exists(store, db, graph)
+        if not existed:
+            _insert_triple(
+                store,
+                subject=_graph_iri(db, graph),
+                predicate=RDFS_LABEL_PREDICATE,
+                obj={"type": "literal", "value": graph},
+                graph_iri=_graph_iri(db, graph),
+            )
+            _add_graph_type(store, db, graph)
+            _link_graph_db(store, db, graph)
+            _link_db_graph(store, db, graph)
+        _insert_triple(
+            store,
+            subject=_graph_iri(db, graph),
+            predicate=p,
+            obj=o,
+            graph_iri=_graph_iri(db, graph),
+        )
+        return _pretty_json_response(
+            {
+                "db": db,
+                "graph": graph,
+                "db_created": db_created,
+                "graph_created": not existed,
+                "triple_created": True,
+            },
+            status_code=201,
+        )
+
     label = payload.get("label", graph)
 
     db_created = not _db_exists(db)
