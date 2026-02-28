@@ -243,6 +243,54 @@ def _viewer_redirect_if_needed(request: Request) -> Response | None:
     return RedirectResponse(url=location, status_code=303)
 
 
+def _incoming_requested(request: Request) -> bool:
+    if "incoming" not in request.query_params:
+        return False
+    raw = (request.query_params.get("incoming") or "").strip().lower()
+    return raw in {"", "1", "true", "yes", "on"}
+
+
+def _incoming_response_for_subject(*, request: Request, subject_uri: str) -> Response:
+    raw_offset = (request.query_params.get("incoming_offset") or "0").strip()
+    raw_limit = (request.query_params.get("incoming_limit") or "10").strip()
+    raw_predicates = request.query_params.get("incoming_predicates")
+    graph_filter = request.query_params.get("incoming_graph")
+
+    try:
+        offset = max(0, int(raw_offset))
+    except ValueError:
+        raise APIError(400, "invalid_incoming_offset", "`incoming_offset` moet integer >= 0 zijn")
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        raise APIError(400, "invalid_incoming_limit", "`incoming_limit` moet integer zijn")
+    if limit < 1 or limit > 1000:
+        raise APIError(400, "invalid_incoming_limit", "`incoming_limit` moet tussen 1 en 1000 liggen")
+
+    predicate_filter = _parse_predicates_param(raw_predicates)
+    if predicate_filter is None:
+        predicate_filter = set(DEFAULT_RELATION_PREDICATES)
+
+    items = _collect_incoming_relations(
+        uri=subject_uri,
+        predicate_filter=predicate_filter,
+        graph_filter=graph_filter,
+    )
+    total = len(items)
+    page = items[offset : offset + limit]
+    next_offset = offset + limit if (offset + limit) < total else None
+    return _pretty_json_response(
+        {
+            "uri": subject_uri,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "next_offset": next_offset,
+            "items": page,
+        }
+    )
+
+
 async def _json_or_empty(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
@@ -943,6 +991,8 @@ def get_db(db: str, request: Request):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
 
     store = _open_store(db)
+    if _incoming_requested(request):
+        return _incoming_response_for_subject(request=request, subject_uri=_db_iri(db))
     _add_db_type(store, db)
     g = _db_graph(store, db)
     if len(g) == 0:
@@ -957,6 +1007,8 @@ def get_db(db: str, request: Request):
 
 @app.get("/id")
 def get_system(request: Request):
+    if _incoming_requested(request):
+        return _incoming_response_for_subject(request=request, subject_uri=_system_iri())
     redirect = _viewer_redirect_if_needed(request)
     if redirect is not None:
         return redirect
@@ -1015,6 +1067,8 @@ def get_definitions(
     resolve_limit: int = Query(1000, ge=1, le=50000),
     resolve_include_root: bool = Query(True),
 ):
+    if _incoming_requested(request):
+        return _incoming_response_for_subject(request=request, subject_uri=DEF_GRAPH_IRI)
     _ensure_def_seeded()
     store = _system_store()
     g = Graph()
@@ -1051,8 +1105,11 @@ def get_definition(
     resolve_include_root: bool = Query(True),
 ):
     _ensure_def_seeded()
+    subject_uri = _def_iri(term)
+    if _incoming_requested(request):
+        return _incoming_response_for_subject(request=request, subject_uri=subject_uri)
     store = _system_store()
-    g = _subject_graph(store, _def_iri(term), DEF_GRAPH_IRI)
+    g = _subject_graph(store, subject_uri, DEF_GRAPH_IRI)
     if len(g) == 0:
         raise APIError(404, "definition_not_found", f"Definitie `{term}` niet gevonden")
     resolve_predicates = _parse_resolve_predicates_param(resolve)
@@ -1257,6 +1314,8 @@ def get_graph(
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
 
     store = _open_store(db)
+    if _incoming_requested(request):
+        return _incoming_response_for_subject(request=request, subject_uri=_graph_iri(db, graph))
     g = _named_graph(store, db, graph)
     if len(g) == 0:
         raise APIError(404, "graph_not_found", f"Graph `{graph}` bestaat niet of bevat geen triples")
@@ -1426,6 +1485,11 @@ def get_resource(
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
 
     store = _open_store(db)
+    if _incoming_requested(request):
+        return _incoming_response_for_subject(
+            request=request,
+            subject_uri=_resource_iri(db, graph, resource),
+        )
     g = _resource_graph(store, db, graph, resource)
     if len(g) == 0:
         raise APIError(404, "resource_not_found", f"Resource `{resource}` niet gevonden")
