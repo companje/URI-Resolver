@@ -268,8 +268,6 @@ def _incoming_response_for_subject(*, request: Request, subject_uri: str) -> Res
         raise APIError(400, "invalid_incoming_limit", "`incoming_limit` moet tussen 1 en 1000 liggen")
 
     predicate_filter = _parse_predicates_param(raw_predicates)
-    if predicate_filter is None:
-        predicate_filter = set(DEFAULT_RELATION_PREDICATES)
 
     items = _collect_incoming_relations(
         uri=subject_uri,
@@ -647,6 +645,21 @@ def _candidate_dbs_for_graph(graph: str | None) -> list[str]:
     return _db_names()
 
 
+def _candidate_store_names_for_relations(graph: str | None) -> list[str]:
+    if graph:
+        prefix = f"{BASE_PUBLIC}/id/"
+        if graph.startswith(prefix):
+            rest = graph[len(prefix) :]
+            db_name = rest.split("/", 1)[0] if rest else ""
+            if db_name:
+                return [db_name]
+        if graph == DEF_GRAPH_IRI:
+            return [SYSTEM_DB_NAME]
+    names: list[str] = [SYSTEM_DB_NAME, *_db_names()]
+    # preserve order while de-duplicating
+    return list(dict.fromkeys(names))
+
+
 def _collect_incoming_relations(
     *,
     uri: str,
@@ -656,10 +669,13 @@ def _collect_incoming_relations(
     target = NamedNode(uri)
     graph_node = NamedNode(graph_filter) if graph_filter else None
     items: list[dict[str, Any]] = []
-    for db_name in _candidate_dbs_for_graph(graph_filter):
-        if not _db_exists(db_name):
-            continue
-        store = _open_store(db_name)
+    for db_name in _candidate_store_names_for_relations(graph_filter):
+        if db_name == SYSTEM_DB_NAME:
+            store = _system_store()
+        else:
+            if not _db_exists(db_name):
+                continue
+            store = _open_store(db_name)
         quads = store.quads_for_pattern(None, None, target, graph_node)
         for quad in quads:
             predicate = _term_to_api_str(quad.predicate)
@@ -690,10 +706,13 @@ def _collect_neighbor_relations(
     target = NamedNode(uri)
     graph_node = NamedNode(graph_filter) if graph_filter else None
     items: list[dict[str, Any]] = []
-    for db_name in _candidate_dbs_for_graph(graph_filter):
-        if not _db_exists(db_name):
-            continue
-        store = _open_store(db_name)
+    for db_name in _candidate_store_names_for_relations(graph_filter):
+        if db_name == SYSTEM_DB_NAME:
+            store = _system_store()
+        else:
+            if not _db_exists(db_name):
+                continue
+            store = _open_store(db_name)
 
         if direction in {"out", "both"}:
             for quad in store.quads_for_pattern(target, None, None, graph_node):
@@ -1595,8 +1614,6 @@ def api_relations_incoming(
     limit: int = Query(100, ge=1, le=1000),
 ):
     predicate_filter = _parse_predicates_param(predicates)
-    if predicate_filter is None:
-        predicate_filter = set(DEFAULT_RELATION_PREDICATES)
     items = _collect_incoming_relations(uri=uri, predicate_filter=predicate_filter, graph_filter=graph)
     total = len(items)
     page = items[offset : offset + limit]
@@ -1621,8 +1638,6 @@ def api_relations_neighbors(
     limit: int = Query(100, ge=1, le=1000),
 ):
     predicate_filter = _parse_predicates_param(predicates)
-    if predicate_filter is None:
-        predicate_filter = set(DEFAULT_RELATION_PREDICATES)
     items = _collect_neighbor_relations(
         uri=uri,
         direction=direction,
