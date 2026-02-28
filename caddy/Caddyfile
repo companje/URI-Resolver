@@ -5,6 +5,7 @@ kvan-todb.hualab.nl {
 	@rdf_html {
 		path /id* /def*
 		header Accept *text/html*
+		not path_regexp rdf_explicit_format ^/(id|def).*\.(ttl|json|jsonld)$
 	}
 	rewrite @rdf_html /?uri=https://{host}{path}
 	reverse_proxy @rdf_html 127.0.0.1:8080
