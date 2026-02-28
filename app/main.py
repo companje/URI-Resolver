@@ -227,6 +227,12 @@ def _has_explicit_rdf_negotiation(request: Request) -> bool:
 def _viewer_redirect_if_needed(request: Request) -> Response | None:
     if TEST_MODE_GET_WRITE and request.query_params:
         return None
+    requested_suffix_format = getattr(request.state, "requested_suffix_format", None)
+    if requested_suffix_format in {"turtle", "json-ld"}:
+        return None
+    original_path = getattr(request.state, "original_request_path", "") or ""
+    if original_path.endswith(".ttl") or original_path.endswith(".json") or original_path.endswith(".jsonld"):
+        return None
     if _has_explicit_rdf_negotiation(request):
         return None
     path = request.scope.get("path", "")
@@ -862,6 +868,8 @@ app = FastAPI(title="Resolvable URIs", version="0.1.0")
 @app.middleware("http")
 async def ttl_extension_override(request: Request, call_next):
     path = request.scope.get("path", "")
+    request.state.original_request_path = path
+    request.state.requested_suffix_format = None
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
         request.scope["path"] = path
@@ -870,10 +878,17 @@ async def ttl_extension_override(request: Request, call_next):
         request.scope["path"] = path[:-4]
         request.scope["raw_path"] = path[:-4].encode("utf-8")
         request.state.forced_format = "turtle"
+        request.state.requested_suffix_format = "turtle"
     if path.endswith(".json"):
         request.scope["path"] = path[:-5]
         request.scope["raw_path"] = path[:-5].encode("utf-8")
         request.state.forced_format = "json-ld"
+        request.state.requested_suffix_format = "json-ld"
+    if path.endswith(".jsonld"):
+        request.scope["path"] = path[:-7]
+        request.scope["raw_path"] = path[:-7].encode("utf-8")
+        request.state.forced_format = "json-ld"
+        request.state.requested_suffix_format = "json-ld"
     return await call_next(request)
 
 
