@@ -1146,7 +1146,10 @@ async def post_db(db: str, request: Request):
 @app.delete("/id/{db}")
 async def delete_db(db: str, request: Request):
     payload = await _json_or_empty(request)
+    action = payload.get("action")
     if "p" in payload:
+        if action is not None and action != "delete_triple":
+            raise APIError(400, "invalid_payload", "Gebruik geen drop action bij triple-delete")
         if not _db_exists(db):
             raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
         p = payload.get("p")
@@ -1164,6 +1167,12 @@ async def delete_db(db: str, request: Request):
         return _pretty_json_response(
             {"db": db, "deleted_triples": deleted, "mode": "triple_delete"},
             status_code=200,
+        )
+    if action != "drop_db":
+        raise APIError(
+            400,
+            "explicit_action_required",
+            "Voor database verwijderen is expliciet `action: \"drop_db\"` vereist",
         )
     cascade = payload.get("cascade", True)
     if not isinstance(cascade, bool):
@@ -1255,6 +1264,32 @@ async def delete_graph(db: str, graph: str, request: Request):
     if not _db_exists(db):
         raise APIError(404, "db_not_found", f"Database `{db}` bestaat niet")
     payload = await _json_or_empty(request)
+    action = payload.get("action")
+    if "p" in payload:
+        if action is not None and action != "delete_triple":
+            raise APIError(400, "invalid_payload", "Gebruik geen drop action bij triple-delete")
+        p = payload.get("p")
+        if not p:
+            raise APIError(400, "invalid_payload", "Payload vereist `p` voor triple-delete")
+        o = payload.get("o")
+        store = _open_store(db)
+        deleted = _delete_triples(
+            store,
+            subject=_graph_iri(db, graph),
+            predicate=p,
+            obj=o,
+            graph_iri=_graph_iri(db, graph),
+        )
+        return _pretty_json_response(
+            {"db": db, "graph": graph, "deleted_triples": deleted, "mode": "triple_delete"},
+            status_code=200,
+        )
+    if action != "drop_graph":
+        raise APIError(
+            400,
+            "explicit_action_required",
+            "Voor graph verwijderen is expliciet `action: \"drop_graph\"` vereist",
+        )
     cascade = payload.get("cascade", True)
     if not isinstance(cascade, bool):
         raise APIError(400, "invalid_payload", "`cascade` moet boolean zijn")

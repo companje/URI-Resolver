@@ -129,7 +129,9 @@ Body (optioneel):
 ```
 
 Opmerking:
-- Alleen cascade delete wordt ondersteund.
+- Voor database-drop is expliciet vereist:
+  - `"action": "drop_db"`
+- Zonder deze action wordt geen database verwijderd.
 - `cascade` default is `true`.
 
 Triple-delete voorbeeld op db-level:
@@ -183,9 +185,14 @@ Verwijdert de volledige graph (alle triples in die named graph) en haalt de
 Body (optioneel):
 ```json
 {
+  "action": "drop_graph",
   "cascade": true
 }
 ```
+
+Let op:
+- Zonder `"action": "drop_graph"` wordt géén graph verwijderd.
+- Met body `{ "p": "...", "o": ... }` doet deze route alleen triple-delete op het graph-subject.
 
 Body (optioneel):
 ```json
