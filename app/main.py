@@ -1007,30 +1007,69 @@ async def delete_system_triples(request: Request):
 
 
 @app.get("/def")
-def get_definitions(request: Request):
-    redirect = _viewer_redirect_if_needed(request)
-    if redirect is not None:
-        return redirect
+def get_definitions(
+    request: Request,
+    resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
+    resolve_depth: int = Query(1, ge=1, le=10),
+    resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
+    resolve_limit: int = Query(1000, ge=1, le=50000),
+    resolve_include_root: bool = Query(True),
+):
     _ensure_def_seeded()
     store = _system_store()
     g = Graph()
     graph_node = NamedNode(DEF_GRAPH_IRI)
     for quad in store.quads_for_pattern(None, None, None, graph_node):
         g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
+    resolve_predicates = _parse_resolve_predicates_param(resolve)
+    if resolve_predicates:
+        g = _resolve_graph_neighbors(
+            store=store,
+            base_graph=g,
+            predicates=resolve_predicates,
+            direction=resolve_direction,
+            depth=resolve_depth,
+            limit=resolve_limit,
+            include_root=resolve_include_root,
+        )
+    if resolve is None:
+        redirect = _viewer_redirect_if_needed(request)
+        if redirect is not None:
+            return redirect
     body, media_type = _serialize_graph(g, _determine_format(request))
     return Response(content=body, media_type=media_type)
 
 
 @app.get("/def/{term:path}")
-def get_definition(term: str, request: Request):
+def get_definition(
+    term: str,
+    request: Request,
+    resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
+    resolve_depth: int = Query(1, ge=1, le=10),
+    resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
+    resolve_limit: int = Query(1000, ge=1, le=50000),
+    resolve_include_root: bool = Query(True),
+):
     _ensure_def_seeded()
     store = _system_store()
     g = _subject_graph(store, _def_iri(term), DEF_GRAPH_IRI)
     if len(g) == 0:
         raise APIError(404, "definition_not_found", f"Definitie `{term}` niet gevonden")
-    redirect = _viewer_redirect_if_needed(request)
-    if redirect is not None:
-        return redirect
+    resolve_predicates = _parse_resolve_predicates_param(resolve)
+    if resolve_predicates:
+        g = _resolve_graph_neighbors(
+            store=store,
+            base_graph=g,
+            predicates=resolve_predicates,
+            direction=resolve_direction,
+            depth=resolve_depth,
+            limit=resolve_limit,
+            include_root=resolve_include_root,
+        )
+    if resolve is None:
+        redirect = _viewer_redirect_if_needed(request)
+        if redirect is not None:
+            return redirect
     body, media_type = _serialize_graph(g, _determine_format(request))
     return Response(content=body, media_type=media_type)
 
