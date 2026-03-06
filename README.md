@@ -33,11 +33,17 @@ Leest triples over de database uit de default graph.
 Bevat o.a. links naar bestaande graphs via predicate:
 `https://schema.org/hasPart` (`sdo:hasPart`).
 
+Optioneel:
+- `predicates`: comma-separated lijst met predicate IRIs (of prefixed vorm zoals `rdfs:label`) om alleen die predicates terug te geven.
+
 ### `GET /id`
 Leest systeemmetadata en bevat links naar databases via predicate:
 `https://schema.org/hasPart` (`sdo:hasPart`).
 Deze system-resource wordt on-the-fly opgebouwd en bevat ook:
 `rdf:type https://kvan-todb.hualab.nl/def/System`.
+
+Optioneel:
+- `predicates`: comma-separated lijst met predicate IRIs (of prefixed vorm) om alleen die predicates terug te geven.
 
 ### `POST /id`
 Voegt een triple toe aan de systeemresource (`https://kvan-todb.hualab.nl/id`).
@@ -68,9 +74,15 @@ Gedrag:
 ### `GET /def`
 Leest alle definitie-triples uit de beheerde `def` graph.
 
+Optioneel:
+- `predicates`: comma-separated lijst met predicate IRIs (of prefixed vorm) om alleen die predicates terug te geven.
+
 ### `GET /def/<term>`
 Leest triples van een specifieke definitie, bijvoorbeeld:
 `/def/Database`.
+
+Optioneel:
+- `predicates`: comma-separated lijst met predicate IRIs (of prefixed vorm) om alleen die predicates terug te geven.
 
 ### `POST /def/<term>`
 Voegt triples toe aan een definitie-resource in de `def` graph.
@@ -154,6 +166,9 @@ Body (optioneel):
 ### `GET /id/<db>/<graph>`
 Leest alle triples uit de named graph.
 
+Optioneel:
+- `predicates`: comma-separated lijst met predicate IRIs (of prefixed vorm) om alleen die predicates terug te geven.
+
 Optioneel resolve-mechanisme (JSON-LD uitbreiden met gerelateerde nodes):
 - `resolve`: JSON array van predicate IRIs
 - `resolve_depth`: default `1`
@@ -204,6 +219,7 @@ Body (optioneel):
 ### `GET /id/<db>/<graph>/<resource>`
 Leest triples van het subject `<resource>` binnen de opgegeven graph.
 Ondersteunt dezelfde `resolve*` query-params als `GET /id/<db>/<graph>`.
+Ondersteunt ook `predicates` voor predicate-filtering.
 
 ### `POST /id/<db>/<graph>/<resource>`
 Voegt een triple toe voor die resource.

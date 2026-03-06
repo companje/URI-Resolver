@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import shutil
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -17,10 +18,12 @@ from rdflib import BNode, Graph, Literal as RdfLiteral, Namespace, URIRef
 
 
 BASE_PUBLIC = os.getenv("PUBLIC_BASE", "https://kvan-todb.hualab.nl").rstrip("/")
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR)))
 TEST_MODE_GET_WRITE = os.getenv("TEST_MODE_GET_WRITE", "false").strip().lower() in {"1", "true", "yes", "on"}
 VIEWER_BASE = os.getenv("VIEWER_BASE", f"{BASE_PUBLIC}").rstrip("/")
-_STORE_CACHE: dict[str, Store] = {}
+MAX_OPEN_STORES = int(os.getenv("MAX_OPEN_STORES", "4"))
+_STORE_CACHE: "OrderedDict[str, Store]" = OrderedDict()
 _STORE_CACHE_LOCK = Lock()
 COMMON_PREFIXES = {
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
@@ -68,9 +71,70 @@ def _db_exists(db: str) -> bool:
     return _db_path(db).exists()
 
 
+def _is_lock_conflict(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "lock" in text and "resource temporarily unavailable" in text
+
+
+def _is_too_many_open_files(exc: Exception) -> bool:
+    return "too many open files" in str(exc).lower()
+
+
+def _store_api_error(db: str, exc: Exception, *, create: bool) -> APIError:
+    if _is_too_many_open_files(exc):
+        return APIError(
+            503,
+            "too_many_open_files",
+            "Te veel geopende bestanden/stores in dit proces",
+            {
+                "db": db,
+                "cause": str(exc),
+                "hint": (
+                    "Verlaag parallelisme/aantal workers of verhoog ulimit; "
+                    "eventueel MAX_OPEN_STORES lager zetten."
+                ),
+            },
+        )
+    if _is_lock_conflict(exc):
+        return APIError(
+            423,
+            "db_locked",
+            f"Database `{db}` is vergrendeld door een ander proces",
+            {
+                "db": db,
+                "cause": str(exc),
+                "hint": "Zorg dat slechts één resolver-proces tegelijk deze DATA_DIR gebruikt.",
+            },
+        )
+    if create:
+        return APIError(
+            500,
+            "store_create_failed",
+            f"Database `{db}` kon niet worden aangemaakt/geopend",
+            {"db": db, "cause": str(exc)},
+        )
+    return APIError(
+        500,
+        "store_open_failed",
+        f"Database `{db}` kon niet worden geopend",
+        {"db": db, "cause": str(exc)},
+    )
+
+
 def _evict_store(db: str) -> None:
     with _STORE_CACHE_LOCK:
         _STORE_CACHE.pop(db, None)
+    gc.collect()
+
+
+def _put_store_in_cache(db: str, store: Store) -> None:
+    with _STORE_CACHE_LOCK:
+        if db in _STORE_CACHE:
+            _STORE_CACHE.pop(db, None)
+        _STORE_CACHE[db] = store
+        while len(_STORE_CACHE) > MAX_OPEN_STORES:
+            _, evicted = _STORE_CACHE.popitem(last=False)
+            del evicted
     gc.collect()
 
 
@@ -78,39 +142,29 @@ def _open_store(db: str) -> Store:
     with _STORE_CACHE_LOCK:
         cached = _STORE_CACHE.get(db)
         if cached is not None:
+            _STORE_CACHE.move_to_end(db)
             return cached
     try:
         store = Store(str(_db_path(db)))
-        with _STORE_CACHE_LOCK:
-            _STORE_CACHE[db] = store
+        _put_store_in_cache(db, store)
         return store
     except Exception as exc:
-        raise APIError(
-            500,
-            "store_open_failed",
-            f"Database `{db}` kon niet worden geopend",
-            {"db": db, "cause": str(exc)},
-        ) from exc
+        raise _store_api_error(db, exc, create=False) from exc
 
 
 def _ensure_store(db: str) -> Store:
     with _STORE_CACHE_LOCK:
         cached = _STORE_CACHE.get(db)
         if cached is not None:
+            _STORE_CACHE.move_to_end(db)
             return cached
     try:
         _db_path(db).mkdir(parents=True, exist_ok=True)
         store = Store(str(_db_path(db)))
-        with _STORE_CACHE_LOCK:
-            _STORE_CACHE[db] = store
+        _put_store_in_cache(db, store)
         return store
     except Exception as exc:
-        raise APIError(
-            500,
-            "store_create_failed",
-            f"Database `{db}` kon niet worden aangemaakt/geopend",
-            {"db": db, "cause": str(exc)},
-        ) from exc
+        raise _store_api_error(db, exc, create=True) from exc
 
 
 def _delete_db(db: str) -> None:
@@ -353,51 +407,104 @@ def _serialize_error(
     )
 
 
-def _resource_graph(store: Store, db: str, graph: str, resource: str) -> Graph:
+def _iter_quads_filtered_by_predicate(
+    *,
+    store: Store,
+    subject: NamedNode | None,
+    graph_name: NamedNode | DefaultGraph,
+    predicate_filter: set[str] | None,
+):
+    if not predicate_filter:
+        for quad in store.quads_for_pattern(subject, None, None, graph_name):
+            yield quad
+        return
+
+    for predicate in sorted(predicate_filter):
+        predicate_node = NamedNode(predicate)
+        for quad in store.quads_for_pattern(subject, predicate_node, None, graph_name):
+            yield quad
+
+
+def _resource_graph(
+    store: Store,
+    db: str,
+    graph: str,
+    resource: str,
+    *,
+    predicate_filter: set[str] | None = None,
+) -> Graph:
     g = Graph()
     graph_node = NamedNode(_graph_iri(db, graph))
     subject = NamedNode(_resource_iri(db, graph, resource))
 
-    for quad in store.quads_for_pattern(subject, None, None, graph_node):
+    for quad in _iter_quads_filtered_by_predicate(
+        store=store,
+        subject=subject,
+        graph_name=graph_node,
+        predicate_filter=predicate_filter,
+    ):
         g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
     return g
 
 
-def _subject_graph(store: Store, subject_iri: str, graph_iri: str | None) -> Graph:
+def _subject_graph(
+    store: Store,
+    subject_iri: str,
+    graph_iri: str | None,
+    *,
+    predicate_filter: set[str] | None = None,
+) -> Graph:
     g = Graph()
     graph_name = NamedNode(graph_iri) if graph_iri else DefaultGraph()
     subject = NamedNode(subject_iri)
-    for quad in store.quads_for_pattern(subject, None, None, graph_name):
+    for quad in _iter_quads_filtered_by_predicate(
+        store=store,
+        subject=subject,
+        graph_name=graph_name,
+        predicate_filter=predicate_filter,
+    ):
         g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
     return g
 
 
-def _named_graph(store: Store, db: str, graph: str) -> Graph:
+def _named_graph(store: Store, db: str, graph: str, *, predicate_filter: set[str] | None = None) -> Graph:
     g = Graph()
     graph_node = NamedNode(_graph_iri(db, graph))
 
-    for quad in store.quads_for_pattern(None, None, None, graph_node):
+    for quad in _iter_quads_filtered_by_predicate(
+        store=store,
+        subject=None,
+        graph_name=graph_node,
+        predicate_filter=predicate_filter,
+    ):
         g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
     return g
 
 
-def _db_graph(store: Store, db: str) -> Graph:
+def _db_graph(store: Store, db: str, *, predicate_filter: set[str] | None = None) -> Graph:
     g = Graph()
     subject = NamedNode(_db_iri(db))
-    for quad in store.quads_for_pattern(subject, None, None, DefaultGraph()):
+    for quad in _iter_quads_filtered_by_predicate(
+        store=store,
+        subject=subject,
+        graph_name=DefaultGraph(),
+        predicate_filter=predicate_filter,
+    ):
         g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
     return g
 
 
-def _system_graph() -> Graph:
+def _system_graph(*, predicate_filter: set[str] | None = None) -> Graph:
     _ensure_system_metadata_seeded()
     store = _system_store()
-    g = _subject_graph(store, _system_iri(), None)
+    g = _subject_graph(store, _system_iri(), None, predicate_filter=predicate_filter)
     system = URIRef(_system_iri())
+    include_has_part = not predicate_filter or HAS_PART_PREDICATE in predicate_filter
     if DATA_DIR.exists():
         for child in sorted(DATA_DIR.iterdir(), key=lambda p: p.name):
             if child.is_dir() and child.name != SYSTEM_DB_NAME:
-                g.add((system, URIRef(HAS_PART_PREDICATE), URIRef(_db_iri(child.name))))
+                if include_has_part:
+                    g.add((system, URIRef(HAS_PART_PREDICATE), URIRef(_db_iri(child.name))))
     return g
 
 
@@ -489,6 +596,28 @@ def _parse_predicates_param(predicates: str | None) -> set[str] | None:
         return None
     values = {p.strip() for p in predicates.split(",") if p.strip()}
     return values or None
+
+
+def _parse_graph_predicates_param(predicates: str | None) -> set[str] | None:
+    values = _parse_predicates_param(predicates)
+    if not values:
+        return None
+
+    expanded = {_expand_prefixed_predicate(value) for value in values}
+    invalid: list[str] = []
+    for value in expanded:
+        try:
+            NamedNode(value)
+        except Exception:
+            invalid.append(value)
+    if invalid:
+        raise APIError(
+            400,
+            "invalid_predicates",
+            "`predicates` bevat ongeldige IRI-waarden",
+            details={"invalid": sorted(invalid)},
+        )
+    return expanded
 
 
 def _expand_prefixed_predicate(value: str) -> str:
@@ -670,28 +799,39 @@ def _collect_incoming_relations(
     graph_node = NamedNode(graph_filter) if graph_filter else None
     items: list[dict[str, Any]] = []
     for db_name in _candidate_store_names_for_relations(graph_filter):
-        if db_name == SYSTEM_DB_NAME:
-            store = _system_store()
-        else:
-            if not _db_exists(db_name):
+        close_after = False
+        try:
+            if db_name == SYSTEM_DB_NAME:
+                store = _system_store()
+            else:
+                if not _db_exists(db_name):
+                    continue
+                store = _open_store(db_name)
+                close_after = True
+        except APIError as exc:
+            if exc.code == "db_locked":
                 continue
-            store = _open_store(db_name)
-        quads = store.quads_for_pattern(None, None, target, graph_node)
-        for quad in quads:
-            predicate = _term_to_api_str(quad.predicate)
-            if predicate_filter and predicate not in predicate_filter:
-                continue
-            graph_value = _graph_name_to_str(quad.graph_name)
-            if graph_filter and graph_value != graph_filter:
-                continue
-            items.append(
-                {
-                    "subject": _term_to_api_str(quad.subject),
-                    "predicate": predicate,
-                    "object": uri,
-                    "graph": graph_value,
-                }
-            )
+            raise
+        try:
+            quads = store.quads_for_pattern(None, None, target, graph_node)
+            for quad in quads:
+                predicate = _term_to_api_str(quad.predicate)
+                if predicate_filter and predicate not in predicate_filter:
+                    continue
+                graph_value = _graph_name_to_str(quad.graph_name)
+                if graph_filter and graph_value != graph_filter:
+                    continue
+                items.append(
+                    {
+                        "subject": _term_to_api_str(quad.subject),
+                        "predicate": predicate,
+                        "object": uri,
+                        "graph": graph_value,
+                    }
+                )
+        finally:
+            if close_after:
+                _evict_store(db_name)
     items.sort(key=lambda i: (i["subject"], i["predicate"], i["graph"] or ""))
     return items
 
@@ -707,48 +847,59 @@ def _collect_neighbor_relations(
     graph_node = NamedNode(graph_filter) if graph_filter else None
     items: list[dict[str, Any]] = []
     for db_name in _candidate_store_names_for_relations(graph_filter):
-        if db_name == SYSTEM_DB_NAME:
-            store = _system_store()
-        else:
-            if not _db_exists(db_name):
+        close_after = False
+        try:
+            if db_name == SYSTEM_DB_NAME:
+                store = _system_store()
+            else:
+                if not _db_exists(db_name):
+                    continue
+                store = _open_store(db_name)
+                close_after = True
+        except APIError as exc:
+            if exc.code == "db_locked":
                 continue
-            store = _open_store(db_name)
+            raise
 
-        if direction in {"out", "both"}:
-            for quad in store.quads_for_pattern(target, None, None, graph_node):
-                predicate = _term_to_api_str(quad.predicate)
-                if predicate_filter and predicate not in predicate_filter:
-                    continue
-                graph_value = _graph_name_to_str(quad.graph_name)
-                if graph_filter and graph_value != graph_filter:
-                    continue
-                items.append(
-                    {
-                        "direction": "out",
-                        "subject": uri,
-                        "predicate": predicate,
-                        "object": _term_to_api_str(quad.object),
-                        "graph": graph_value,
-                    }
-                )
+        try:
+            if direction in {"out", "both"}:
+                for quad in store.quads_for_pattern(target, None, None, graph_node):
+                    predicate = _term_to_api_str(quad.predicate)
+                    if predicate_filter and predicate not in predicate_filter:
+                        continue
+                    graph_value = _graph_name_to_str(quad.graph_name)
+                    if graph_filter and graph_value != graph_filter:
+                        continue
+                    items.append(
+                        {
+                            "direction": "out",
+                            "subject": uri,
+                            "predicate": predicate,
+                            "object": _term_to_api_str(quad.object),
+                            "graph": graph_value,
+                        }
+                    )
 
-        if direction in {"in", "both"}:
-            for quad in store.quads_for_pattern(None, None, target, graph_node):
-                predicate = _term_to_api_str(quad.predicate)
-                if predicate_filter and predicate not in predicate_filter:
-                    continue
-                graph_value = _graph_name_to_str(quad.graph_name)
-                if graph_filter and graph_value != graph_filter:
-                    continue
-                items.append(
-                    {
-                        "direction": "in",
-                        "subject": _term_to_api_str(quad.subject),
-                        "predicate": predicate,
-                        "object": uri,
-                        "graph": graph_value,
-                    }
-                )
+            if direction in {"in", "both"}:
+                for quad in store.quads_for_pattern(None, None, target, graph_node):
+                    predicate = _term_to_api_str(quad.predicate)
+                    if predicate_filter and predicate not in predicate_filter:
+                        continue
+                    graph_value = _graph_name_to_str(quad.graph_name)
+                    if graph_filter and graph_value != graph_filter:
+                        continue
+                    items.append(
+                        {
+                            "direction": "in",
+                            "subject": _term_to_api_str(quad.subject),
+                            "predicate": predicate,
+                            "object": uri,
+                            "graph": graph_value,
+                        }
+                    )
+        finally:
+            if close_after:
+                _evict_store(db_name)
 
     items.sort(
         key=lambda i: (
@@ -993,7 +1144,7 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 
 @app.get("/id/{db}")
-def get_db(db: str, request: Request):
+def get_db(db: str, request: Request, predicates: str | None = Query(None, description="Comma-separated predicate IRIs")):
     if TEST_MODE_GET_WRITE and not _db_exists(db):
         store = _ensure_store(db)
         _add_db_type(store, db)
@@ -1013,7 +1164,8 @@ def get_db(db: str, request: Request):
     if _incoming_requested(request):
         return _incoming_response_for_subject(request=request, subject_uri=_db_iri(db))
     _add_db_type(store, db)
-    g = _db_graph(store, db)
+    predicate_filter = _parse_graph_predicates_param(predicates)
+    g = _db_graph(store, db, predicate_filter=predicate_filter)
     if len(g) == 0:
         raise APIError(404, "db_description_not_found", "Geen triples gevonden voor database in default graph")
 
@@ -1025,13 +1177,14 @@ def get_db(db: str, request: Request):
 
 
 @app.get("/id")
-def get_system(request: Request):
+def get_system(request: Request, predicates: str | None = Query(None, description="Comma-separated predicate IRIs")):
     if _incoming_requested(request):
         return _incoming_response_for_subject(request=request, subject_uri=_system_iri())
     redirect = _viewer_redirect_if_needed(request)
     if redirect is not None:
         return redirect
-    g = _system_graph()
+    predicate_filter = _parse_graph_predicates_param(predicates)
+    g = _system_graph(predicate_filter=predicate_filter)
     body, media_type = _serialize_graph(g, _determine_format(request))
     return Response(content=body, media_type=media_type)
 
@@ -1080,6 +1233,7 @@ async def delete_system_triples(request: Request):
 @app.get("/def")
 def get_definitions(
     request: Request,
+    predicates: str | None = Query(None, description="Comma-separated predicate IRIs"),
     resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
     resolve_depth: int = Query(1, ge=1, le=10),
     resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
@@ -1092,7 +1246,13 @@ def get_definitions(
     store = _system_store()
     g = Graph()
     graph_node = NamedNode(DEF_GRAPH_IRI)
-    for quad in store.quads_for_pattern(None, None, None, graph_node):
+    predicate_filter = _parse_graph_predicates_param(predicates)
+    for quad in _iter_quads_filtered_by_predicate(
+        store=store,
+        subject=None,
+        graph_name=graph_node,
+        predicate_filter=predicate_filter,
+    ):
         g.add((_term_to_rdflib(quad.subject), _term_to_rdflib(quad.predicate), _term_to_rdflib(quad.object)))
     resolve_predicates = _parse_resolve_predicates_param(resolve)
     if resolve_predicates:
@@ -1117,6 +1277,7 @@ def get_definitions(
 def get_definition(
     term: str,
     request: Request,
+    predicates: str | None = Query(None, description="Comma-separated predicate IRIs"),
     resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
     resolve_depth: int = Query(1, ge=1, le=10),
     resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
@@ -1128,7 +1289,8 @@ def get_definition(
     if _incoming_requested(request):
         return _incoming_response_for_subject(request=request, subject_uri=subject_uri)
     store = _system_store()
-    g = _subject_graph(store, subject_uri, DEF_GRAPH_IRI)
+    predicate_filter = _parse_graph_predicates_param(predicates)
+    g = _subject_graph(store, subject_uri, DEF_GRAPH_IRI, predicate_filter=predicate_filter)
     if len(g) == 0:
         raise APIError(404, "definition_not_found", f"Definitie `{term}` niet gevonden")
     resolve_predicates = _parse_resolve_predicates_param(resolve)
@@ -1322,6 +1484,7 @@ def get_graph(
     db: str,
     graph: str,
     request: Request,
+    predicates: str | None = Query(None, description="Comma-separated predicate IRIs"),
     resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
     resolve_depth: int = Query(1, ge=1, le=10),
     resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
@@ -1335,7 +1498,8 @@ def get_graph(
     store = _open_store(db)
     if _incoming_requested(request):
         return _incoming_response_for_subject(request=request, subject_uri=_graph_iri(db, graph))
-    g = _named_graph(store, db, graph)
+    predicate_filter = _parse_graph_predicates_param(predicates)
+    g = _named_graph(store, db, graph, predicate_filter=predicate_filter)
     if len(g) == 0:
         raise APIError(404, "graph_not_found", f"Graph `{graph}` bestaat niet of bevat geen triples")
 
@@ -1493,6 +1657,7 @@ def get_resource(
     graph: str,
     resource: str,
     request: Request,
+    predicates: str | None = Query(None, description="Comma-separated predicate IRIs"),
     resolve: str | None = Query(None, description="JSON array met predicate IRIs"),
     resolve_depth: int = Query(1, ge=1, le=10),
     resolve_direction: str = Query("out", pattern="^(out|in|both)$"),
@@ -1509,7 +1674,8 @@ def get_resource(
             request=request,
             subject_uri=_resource_iri(db, graph, resource),
         )
-    g = _resource_graph(store, db, graph, resource)
+    predicate_filter = _parse_graph_predicates_param(predicates)
+    g = _resource_graph(store, db, graph, resource, predicate_filter=predicate_filter)
     if len(g) == 0:
         raise APIError(404, "resource_not_found", f"Resource `{resource}` niet gevonden")
 
